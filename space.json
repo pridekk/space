@@ -1,0 +1,847 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "JetBrains Space On-Premises Installation",
+    "Parameters": {
+        "AdminUsername": {
+            "Description": "Administrator username",
+            "Type": "String",
+            "Default": "admin",
+            "AllowedPattern": "[a-zA-Z0-9._-]+",
+            "MinLength": 2,
+            "ConstraintDescription": "Please enter a valid administrator username"
+        },
+        "AdminPassword": {
+            "Description": "Administrator password",
+            "Type": "String",
+            "NoEcho": true,
+            "MinLength": 1,
+            "ConstraintDescription": "Please enter a valid administrator password"
+        },
+        "AdminEmail": {
+            "Description": "Administrator email",
+            "Type": "String",
+            "AllowedPattern": "[^@]+@[^@]+\\.[^@]+",
+            "ConstraintDescription": "Please enter a valid administrator email"
+        },
+        "HostedZoneName": {
+            "Description": "Existing AWS hosted zone name to use your own domain (optional; without trailing dot)",
+            "Type": "String",
+            "Default": "",
+            "AllowedPattern": "|([^\\.](.*[^\\.])?)",
+            "ConstraintDescription": "Please remove the leading and trailing dots from the hosted zone name"
+        },
+        "Size": {
+            "Description": "Space installation size",
+            "Type": "String",
+            "Default": "Small",
+            "AllowedValues": ["Small", "Medium", "Large"]
+        }
+    },
+    "Conditions": {
+        "OwnDomain": {"Fn::Not": [{"Fn::Equals": [{"Ref": "HostedZoneName"}, ""]}]}
+    },
+    "Mappings": {
+        "Size2Values": {
+            "Small": {
+                "InstanceType": "t4g.xlarge",
+                "DBInstanceType": "db.t4g.medium",
+                "DBAllocatedStorage": 50
+            },
+            "Medium": {
+                "InstanceType": "t4g.xlarge",
+                "DBInstanceType": "db.t4g.large",
+                "DBAllocatedStorage": 100
+            },
+            "Large": {
+                "InstanceType": "t4g.2xlarge",
+                "DBInstanceType": "db.t4g.xlarge",
+                "DBAllocatedStorage": 200
+            }
+        },
+        "Region2Image": {
+            "ap-northeast-1": {"ImageId": "ami-056d305ed60a8c958"},
+            "ap-northeast-2": {"ImageId": "ami-06084908c004b38e9"}
+        }
+    },
+    "Resources": {
+
+        "WebServerInstance": {
+            "Type": "AWS::EC2::Instance",
+            "Metadata": {
+                "AWS::CloudFormation::Init": {
+                    "configSets": {
+                        "InstallAndStart": ["Install-1", "Install-2", "Start", "Wait"],
+                        "InstallAndRestart": ["Install-1", "Install-2", "Start", "Restart", "Wait"]
+                    },
+                    "Install-1": {
+                        "packages": {
+                            "yum": {
+                                "awscli": [],
+                                "docker": [],
+                                "bind-utils": []
+                            }
+                        },
+                        "files": {
+                            "/opt/space/docker-compose.yaml": {
+                                "source": "https://assets.on-premises.service.jetbrains.space/2023.2.0/docker-compose.yml"
+                            },
+                            "/opt/space/docker-compose.override.yaml.tpl": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "version: '3.8'",
+                                            "services:",
+                                            "    init-configs:",
+                                            "        env_file: .env",
+                                            "        entrypoint: /prepare_aws_cf_configs.sh",
+                                            "    space:",
+                                            "        depends_on:",
+                                            "            postgres:",
+                                            "                condition: service_completed_successfully",
+                                            "            minio:",
+                                            "                condition: service_completed_successfully",
+                                            "    vcs:",
+                                            "        ports:",
+                                            "            - '22:22'",
+                                            "            - '8080:8080'",
+                                            "        depends_on:",
+                                            "            postgres:",
+                                            "                condition: service_completed_successfully",
+                                            "            minio:",
+                                            "                condition: service_completed_successfully",
+                                            "    packages:",
+                                            "        depends_on:",
+                                            "            postgres:",
+                                            "                condition: service_completed_successfully",
+                                            "            minio:",
+                                            "                condition: service_completed_successfully",
+                                            "    nginx:",
+                                            "        image: nginx",
+                                            "        entrypoint: /bin/sh -c 'cp -f /etc/nginx/conf.d/space/nginx.conf /etc/nginx/conf.d/default.conf; exec /docker-entrypoint.sh nginx -g \"daemon off;\"'",
+                                            "        volumes:",
+                                            "            - config:/etc/nginx/conf.d/space:ro",
+                                            "            - /etc/letsencrypt:/etc/letsencrypt:ro",
+                                            "        depends_on:",
+                                            "            init-configs:",
+                                            "                condition: service_completed_successfully",
+                                            "            space:",
+                                            "                condition: service_started",
+                                            "            packages:",
+                                            "                condition: service_started",
+                                            "            vcs:",
+                                            "                condition: service_started",
+                                            "        ports:",
+                                            "            - '@FRONTEND_PORT@:@FRONTEND_PORT@'",
+                                            "        networks:",
+                                            "            - 'frontend'",
+                                            "    postgres:",
+                                            "        image: alpine",
+                                            "        entrypoint: /bin/true",
+                                            "    minio:",
+                                            "        image: alpine",
+                                            "        entrypoint: /bin/true"
+                                        ]
+                                    ]
+                                }
+                            },
+                            "/opt/space/.env.tpl": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "SPACE_AWS_REGION=", {"Ref": "AWS::Region"}, "\n",
+                                            "SPACE_AWS_CF_STACK_NAME=", {"Ref": "AWS::StackName"}, "\n",
+                                            "SPACE_ADMIN_USERNAME=", {"Ref": "AdminUsername"}, "\n",
+                                            "SPACE_ADMIN_PASSWORD=", {"Ref": "AdminPassword"}, "\n",
+                                            "SPACE_ADMIN_EMAIL=", {"Ref": "AdminEmail"}, "\n",
+                                            "SPACE_DB_USERNAME=spaceuser\n",
+                                            "SPACE_DB_PASSWORD=@DB_PASSWORD@\n",
+                                            "SPACE_DB_HOST=", {"Fn::Sub": "${Database.Endpoint.Address}"}, "\n",
+                                            "SPACE_DB_PORT=", {"Fn::Sub": "${Database.Endpoint.Port}"}, "\n",
+                                            "SPACE_URL_SCHEMA=", {"Fn::If": ["OwnDomain", "https", "http"]}, "\n",
+                                            "SPACE_HOSTNAME=@FRONTEND_HOSTNAME@\n",
+                                            "SPACE_S3_BUCKET=", {"Ref": "SpaceBucket"}, "\n",
+                                            "SPACE_PACKAGES_S3_BUCKET=", {"Ref": "PackagesBucket"}, "\n",
+                                            "SPACE_VCS_S3_BUCKET=", {"Ref": "VcsBucket"}, "\n",
+                                            "SPACE_AUTOMATION_DSL_S3_BUCKET=", {"Ref": "AutomationDslBucket"}, "\n",
+                                            "SPACE_AUTOMATION_FILESHARE_S3_BUCKET=", {"Ref": "AutomationFileshareBucket"}, "\n",
+                                            "SPACE_AUTOMATION_LOGS_S3_BUCKET=", {"Ref": "AutomationLogsBucket"}, "\n"
+                                        ]
+                                    ]
+                                }
+                            },
+                            "/opt/space/.elastic.ip": {
+                                "content": {"Ref": "ElasticIP"}
+                            },
+                            "/opt/space/.schema": {
+                                "content": {"Fn::If": ["OwnDomain", "https", "http"]}
+                            },
+                            "/opt/space/.hostname": {
+                                "content": {
+                                    "Fn::If": [
+                                        "OwnDomain",
+                                        {"Ref": "HostedZoneName"},
+                                        {"Fn::Join": ["", ["space-", {"Fn::Join": ["-", {"Fn::Split": [".", {"Ref": "ElasticIP"}]}]}, ".nip.io"]]}
+                                    ]
+                                }
+                            },
+                            "/opt/space/space-ssl.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "#!/bin/bash -xe\n",
+                                            "ELASTIC_IP=$(cat /opt/space/.elastic.ip)\n",
+                                            "/opt/space/wait-for-public-ip.sh \"${ELASTIC_IP}\"\n",
+                                            "FRONTEND_HOSTNAME=$(cat /opt/space/.hostname)\n",
+                                            "/opt/space/wait-for-dns-record.sh 'Space' \"${FRONTEND_HOSTNAME}\" \"${ELASTIC_IP}\"\n",
+                                            "/opt/space/wait-for-dns-record.sh 'Space Packages' \"pkg.${FRONTEND_HOSTNAME}\" \"${ELASTIC_IP}\"\n",
+                                            "/opt/space/wait-for-dns-record.sh 'Space VCS' \"git.${FRONTEND_HOSTNAME}\" \"${ELASTIC_IP}\"\n",
+                                            "if [ \"$(cat /opt/space/.schema)\" = \"https\" ]; then\n",
+                                            "    if [ -f \"/etc/letsencrypt/live/${FRONTEND_HOSTNAME}/fullchain.pem\" ]; then\n",
+                                            "        sudo certbot renew -n --cert-name ${FRONTEND_HOSTNAME}\n",
+                                            "    else\n",
+                                            "        sudo certbot certonly --standalone --agree-tos --email '", {"Ref": "AdminEmail"}, "' -n -d ${FRONTEND_HOSTNAME} -d pkg.${FRONTEND_HOSTNAME} -d git.${FRONTEND_HOSTNAME}\n",
+                                            "    fi\n",
+                                            "fi\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/opt/space/wait-for-dns-record.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "#!/bin/bash -xe",
+                                            "while [ \"$(dig $2 +short)\" != \"$3\" ]; do",
+                                            "    echo \"Waiting for $1 DNS record to be ready...\"",
+                                            "    sleep 3",
+                                            "done"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/opt/space/wait-for-public-ip.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "#!/bin/bash -xe",
+                                            "while [ \"$(curl http://169.254.169.254/latest/meta-data/public-ipv4)\" != \"$1\" ]; do",
+                                            "    echo \"Waiting for public IP to be '$1'...\"",
+                                            "    sleep 3",
+                                            "done"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/opt/space/restart-services.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "#!/bin/bash -xe",
+                                            "sudo systemctl restart space-ssl",
+                                            "sudo systemctl restart space"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/opt/space/wait-for-space.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "#!/bin/bash -xe",
+                                            "while [ \"$(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8084)\" != \"200\" ]; do",
+                                            "    echo Waiting for Space to be ready...",
+                                            "    sleep 3",
+                                            "done"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/opt/space/dump-logs-to-s3.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "#!/bin/bash -x\n",
+                                            "sudo rm -rf /opt/space/logs*\n",
+                                            "sudo mkdir -p /opt/space/logs\n",
+                                            "sudo chmod 777 /opt/space/logs\n",
+                                            "sudo systemctl status -l -n 500 space > /opt/space/logs/status-space.txt\n",
+                                            "sudo systemctl status -l -n 500 space-ssl > /opt/space/logs/status-space-ssl.txt\n",
+                                            "sudo systemctl status -l -n 500 cfn-hup > /opt/space/logs/status-cfn-hup.txt\n",
+                                            "docker ps -a > /opt/space/logs/status-docker.txt\n",
+                                            "docker logs space-nginx-1 > /opt/space/logs/nginx.log 2>&1\n",
+                                            "docker logs space-init-configs-1 > /opt/space/logs/init-configs.log 2>&1\n",
+                                            "docker logs space-space-1 > /opt/space/logs/space.log 2>&1\n",
+                                            "docker logs space-packages-1 > /opt/space/logs/packages.log 2>&1\n",
+                                            "docker logs space-langservice-1 > /opt/space/logs/langservice.log 2>&1\n",
+                                            "docker logs space-vcs-1 > /opt/space/logs/vcs.log 2>&1\n",
+                                            "docker logs space-elasticsearch-1 > /opt/space/logs/elasticsearch.log 2>&1\n",
+                                            "docker logs space-redis-1 > /opt/space/logs/redis.log 2>&1\n",
+                                            "cp -f /var/log/cfn-init.log /opt/space/logs/cfn-init.log\n",
+                                            "cp -f /var/log/cfn-hup.log /opt/space/logs/cfn-hup.log\n",
+                                            "ARCHIVE=/opt/space/logs-$(date +%s).tgz\n",
+                                            "sudo tar -zcvf $ARCHIVE /opt/space/logs/\n",
+                                            "sudo aws s3 cp $ARCHIVE s3://", {"Ref": "SpaceBucket"}, "/logs/\n",
+                                            "sudo rm -rf /opt/space/logs*\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/etc/cfn/cfn-hup.conf": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "[main]\n",
+                                            "stack=", {"Ref": "AWS::StackId"}, "\n",
+                                            "region=", {"Ref": "AWS::Region"}, "\n",
+                                            "interval=1\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000400",
+                                "owner": "root",
+                                "group": "root"
+                            },
+                            "/etc/cfn/hooks.d/cfn-auto-reloader.conf": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "[cfn-auto-reloader-hook]",
+                                            "triggers=post.update",
+                                            "path=Resources.WebServerInstance.Metadata.AWS::CloudFormation::Init",
+                                            "action=/tmp/cfn-hook.sh",
+                                            "runas=root"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000400",
+                                "owner": "root",
+                                "group": "root"
+                            },
+                            "/etc/systemd/system/space.service": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "[Unit]",
+                                            "Description=JetBrains Space",
+                                            "Requires=docker.service space-ssl.service",
+                                            "After=docker.service space-ssl.service",
+                                            "",
+                                            "[Service]",
+                                            "WorkingDirectory=/opt/space",
+                                            "ExecStart=/usr/local/bin/docker-compose up",
+                                            "ExecStop=/usr/local/bin/docker-compose down",
+                                            "Restart=always",
+                                            "",
+                                            "[Install]",
+                                            "WantedBy=multi-user.target"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000400",
+                                "owner": "root",
+                                "group": "root"
+                            },
+                            "/etc/systemd/system/space-ssl.service": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "\n",
+                                        [
+                                            "[Unit]",
+                                            "Description=JetBrains Space SSL",
+                                            "After=local-fs.target network.target",
+                                            "",
+                                            "[Service]",
+                                            "WorkingDirectory=/opt/space",
+                                            "ExecStartPre=/opt/space/space-ssl.sh",
+                                            "ExecStart=/bin/bash -c \"while true; do sleep 1209600; /opt/space/space-ssl.sh; done\"",
+                                            "Restart=always",
+                                            "",
+                                            "[Install]",
+                                            "WantedBy=multi-user.target"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000400",
+                                "owner": "root",
+                                "group": "root"
+                            },
+                            "/tmp/setup-system.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "#!/bin/bash -xe\n",
+                                            "while [ ! -f /usr/local/bin/docker-compose ]; do\n",
+                                            "    sudo curl -L https://github.com/docker/compose/releases/download/v2.16.0/docker-compose-$(uname -s)-$(uname -m) -o /usr/local/bin/docker-compose || sleep 1\n",
+                                            "done\n",
+                                            "sudo chmod +x /usr/local/bin/docker-compose\n",
+                                            "/usr/local/bin/docker-compose version\n",
+                                            "while ! sudo amazon-linux-extras install epel -y; do sleep 1; done\n",
+                                            "while ! sudo yum install -y certbot; do sleep 1; done\n",
+                                            "sudo sed -i 's/#Port 22/Port 9222/' /etc/ssh/sshd_config\n",
+                                            "sudo systemctl restart sshd\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/tmp/init-configs.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "#!/bin/bash -e\n",
+                                            "DB_PASSWORD=$(aws --region ", {"Ref": "AWS::Region"}, " secretsmanager get-secret-value --secret-id /space/", {"Ref": "AWS::StackName"}, "/db-password --query SecretString --output text)\n",
+                                            "sed -i \"s/@DB_PASSWORD@/${DB_PASSWORD}/\" /opt/space/.env.tpl\n",
+                                            "FRONTEND_HOSTNAME=$(cat /opt/space/.hostname)\n",
+                                            "sed \"s/@FRONTEND_HOSTNAME@/${FRONTEND_HOSTNAME}/\" /opt/space/.env.tpl > /opt/space/.env\n",
+                                            "if [ \"$(cat /opt/space/.schema)\" = \"https\" ]; then\n",
+                                            "    FRONTEND_PORT=443\n",
+                                            "else\n",
+                                            "    FRONTEND_PORT=80\n",
+                                            "fi\n",
+                                            "sed \"s/@FRONTEND_PORT@/${FRONTEND_PORT}/g\" /opt/space/docker-compose.override.yaml.tpl > /opt/space/docker-compose.override.yaml\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/tmp/cfn-hook.sh": {
+                                "content": {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                            "#!/bin/bash -xe\n",
+                                            "/opt/aws/bin/cfn-init -v --stack '", {"Ref": "AWS::StackName"}, "' --resource WebServerInstance --configsets InstallAndRestart --region ", {"Ref": "AWS::Region"}, "\n",
+                                            "/opt/aws/bin/cfn-signal -e $? \"", {"Ref": "WebServerInstanceIsReadyHandle"}, "\" || true\n"
+                                        ]
+                                    ]
+                                },
+                                "mode": "000555"
+                            },
+                            "/root/.docker/daemon.json": {
+                                "content": "{\"log-driver\":\"json-file\",\"log-opts\":{\"max-size\":\"10m\",\"max-file\":\"5\"}}",
+                                "mode": "000644"
+                            }
+                        }
+                    },
+                    "Install-2": {
+                        "commands": {
+                            "setup-system": {
+                                "command": "/tmp/setup-system.sh"
+                            },
+                            "init-configs": {
+                                "command": "/tmp/init-configs.sh"
+                            }
+                        }
+                    },
+                    "Start": {
+                        "services": {
+                            "sysvinit": {
+                                "space": {
+                                    "enabled": "true",
+                                    "ensureRunning": "true"
+                                },
+                                "cfn-hup": {
+                                    "enabled": "true",
+                                    "ensureRunning": "true",
+                                    "files": ["/etc/cfn/cfn-hup.conf", "/etc/cfn/hooks.d/cfn-auto-reloader.conf", "/tmp/cfn-hook.sh"]
+                                }
+                            }
+                        }
+                    },
+                    "Restart": {
+                        "commands": {
+                            "restart-services": {
+                                "command": "/opt/space/restart-services.sh"
+                            }
+                        }
+                    },
+                    "Wait": {
+                        "commands": {
+                            "wait-for-space": {
+                                "command": "/opt/space/wait-for-space.sh"
+                            }
+                        }
+                    }
+                }
+            },
+            "Properties": {
+                "ImageId": {"Fn::FindInMap": ["Region2Image", {"Ref": "AWS::Region"}, "ImageId"]},
+                "InstanceType": {"Fn::FindInMap": ["Size2Values", {"Ref": "Size"}, "InstanceType"]},
+                "IamInstanceProfile": {"Ref": "WebServerProfile"},
+                "SecurityGroupIds": [{"Ref": "WebServerSecurityGroup"}],
+                "SubnetId": {"Ref": "WebServerSubnet"},
+                "KeyName": {"Fn::Sub": "space-${AWS::StackName}-ssh-key"},
+                "UserData": {
+                    "Fn::Base64": {
+                        "Fn::Join": [
+                            "",
+                            [
+                                "#!/bin/bash -xe\n",
+                                "yum install -y aws-cfn-bootstrap\n",
+                                "/opt/aws/bin/cfn-signal -e 0 --stack '", {"Ref": "AWS::StackName"}, "' --resource WebServerInstance --region ", {"Ref": "AWS::Region"}, "\n",
+                                "/opt/aws/bin/cfn-init -v --stack '", {"Ref": "AWS::StackName"}, "' --resource WebServerInstance --configsets InstallAndStart --region ", {"Ref": "AWS::Region"}, "\n",
+                                "/opt/aws/bin/cfn-signal -e $? \"", {"Ref": "WebServerInstanceIsReadyHandle"}, "\"\n"
+                            ]
+                        ]
+                    }
+                }
+            },
+            "DependsOn": ["WebServerKeyPair", "Database", "DBUserPassword"],
+            "CreationPolicy": {
+                "ResourceSignal": {
+                    "Timeout": "PT5M"
+                }
+            }
+        },
+        "WebServerSecurityGroup": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "Enable HTTP(S) and SSH traffic for Space EC2 machine",
+                "VpcId": {"Ref": "SpaceVPC"},
+                "SecurityGroupIngress": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "80",
+                        "ToPort": "80",
+                        "CidrIp": "0.0.0.0/0"
+                    },
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "443",
+                        "ToPort": "443",
+                        "CidrIp": "0.0.0.0/0"
+                    },
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "22",
+                        "ToPort": "22",
+                        "CidrIp": "0.0.0.0/0"
+                    },
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "9222",
+                        "ToPort": "9222",
+                        "CidrIp": "0.0.0.0/0"
+                    }
+                ]
+            }
+        },
+        "WebServerKeyPair": {
+            "Type": "AWS::EC2::KeyPair",
+            "Properties": {
+                "KeyName": {"Fn::Sub": "space-${AWS::StackName}-ssh-key"}
+            }
+        },
+        "WebServerProfile": {
+            "Type": "AWS::IAM::InstanceProfile",
+            "Properties": {
+                "Roles": [{"Ref": "WebServerRole"}]
+            }
+        },
+        "WebServerRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "Description": "Space EC2 instance role",
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"Service": ["ec2.amazonaws.com"]},
+                            "Action": ["sts:AssumeRole"]
+                        }
+                    ]
+                },
+                "Policies": [
+                    {
+                        "PolicyName": "root",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": ["secretsmanager:GetSecretValue", "secretsmanager:CreateSecret"],
+                                    "Resource": [
+                                        {"Fn::Sub": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/space/${AWS::StackName}/*"},
+                                        {"Fn::Sub": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/space/master-secret*"}
+                                    ]
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "s3:*",
+                                    "Resource": [
+                                        {"Fn::Sub": "${SpaceBucket.Arn}"},
+                                        {"Fn::Sub": "${SpaceBucket.Arn}/*"},
+                                        {"Fn::Sub": "${PackagesBucket.Arn}"},
+                                        {"Fn::Sub": "${PackagesBucket.Arn}/*"},
+                                        {"Fn::Sub": "${VcsBucket.Arn}"},
+                                        {"Fn::Sub": "${VcsBucket.Arn}/*"},
+                                        {"Fn::Sub": "${AutomationDslBucket.Arn}"},
+                                        {"Fn::Sub": "${AutomationDslBucket.Arn}/*"},
+                                        {"Fn::Sub": "${AutomationFileshareBucket.Arn}"},
+                                        {"Fn::Sub": "${AutomationFileshareBucket.Arn}/*"},
+                                        {"Fn::Sub": "${AutomationLogsBucket.Arn}"},
+                                        {"Fn::Sub": "${AutomationLogsBucket.Arn}/*"}
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "WebServerInstanceIsReady": {
+            "Type": "AWS::CloudFormation::WaitCondition",
+            "Properties": {
+                "Handle": {"Ref": "WebServerInstanceIsReadyHandle"},
+                "Timeout": "600"
+            },
+            "DependsOn": ["WebServerInstance"]
+        },
+        "WebServerInstanceIsReadyHandle": {
+            "Type": "AWS::CloudFormation::WaitConditionHandle"
+        },
+        "ElasticIPAssociation": {
+            "Type": "AWS::EC2::EIPAssociation",
+            "Properties": {
+                "AllocationId": {"Fn::Sub": "${ElasticIP.AllocationId}"},
+                "InstanceId": {"Ref": "WebServerInstance"}
+            }
+        },
+        "Database": {
+            "Type": "AWS::RDS::DBInstance",
+            "Properties": {
+                "DBInstanceClass": {"Fn::FindInMap": ["Size2Values", {"Ref": "Size"}, "DBInstanceType"]},
+                "VPCSecurityGroups": [{"Ref": "DBSecurityGroup"}],
+                "DBSubnetGroupName": {"Ref": "DBSubnetGroup"},
+                "Engine": "postgres",
+                "EngineVersion": "14.6",
+                "AllocatedStorage": {"Fn::FindInMap": ["Size2Values", {"Ref": "Size"}, "DBAllocatedStorage"]},
+                "BackupRetentionPeriod": 7,
+                "EnablePerformanceInsights": true,
+                "DBName": "spacedb",
+                "MasterUsername": "spaceuser",
+                "MasterUserPassword": {"Fn::Sub": "{{resolve:secretsmanager:${DBUserPassword}:SecretString}}"}
+            }
+        },
+        "DBSecurityGroup": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "Enable Space DB access for Space EC2 machine",
+                "VpcId": {"Ref": "SpaceVPC"},
+                "SecurityGroupIngress": {
+                    "IpProtocol": "-1",
+                    "SourceSecurityGroupId": {"Ref": "WebServerSecurityGroup"}
+                }
+            }
+        },
+        "DBUserPassword": {
+            "Type": "AWS::SecretsManager::Secret",
+            "Properties": {
+                "Name": {"Fn::Sub": "/space/${AWS::StackName}/db-password"},
+                "Description": "Space DB user password",
+                "GenerateSecretString": {
+                    "PasswordLength": 32,
+                    "ExcludePunctuation": true,
+                    "RequireEachIncludedType": true
+                }
+            }
+        },
+        "SpaceVPC": {
+            "Type": "AWS::EC2::VPC",
+            "Properties": {
+                "CidrBlock": "10.10.10.0/24"
+            }
+        },
+        "WebServerSubnet": {
+            "Type": "AWS::EC2::Subnet",
+            "Properties": {
+                "VpcId": {"Ref": "SpaceVPC"},
+                "CidrBlock": "10.10.10.0/28",
+                "MapPublicIpOnLaunch": true
+            }
+        },
+        "DBSubnetA": {
+            "Type": "AWS::EC2::Subnet",
+            "Properties": {
+                "VpcId": {"Ref": "SpaceVPC"},
+                "CidrBlock": "10.10.10.16/28",
+                "AvailabilityZone": {"Fn::Sub": "${AWS::Region}a"}
+            }
+        },
+        "DBSubnetB": {
+            "Type": "AWS::EC2::Subnet",
+            "Properties": {
+                "VpcId": {"Ref": "SpaceVPC"},
+                "CidrBlock": "10.10.10.32/28",
+                "AvailabilityZone": {"Fn::Sub": "${AWS::Region}b"}
+            }
+        },
+        "DBSubnetGroup": {
+            "Type": "AWS::RDS::DBSubnetGroup",
+            "Properties": {
+                "DBSubnetGroupDescription": "Space DB subnet group",
+                "SubnetIds": [{"Ref": "DBSubnetA"}, {"Ref": "DBSubnetB"}]
+            }
+        },
+        "SpaceIGW": {
+            "Type": "AWS::EC2::InternetGateway"
+        },
+        "SpaceIGWAttachment": {
+            "Type": "AWS::EC2::VPCGatewayAttachment",
+            "Properties": {
+                "VpcId": {"Ref": "SpaceVPC"},
+                "InternetGatewayId": {"Ref": "SpaceIGW"}
+            }
+        },
+        "WebServerSubnetRouteTable": {
+            "Type": "AWS::EC2::RouteTable",
+            "Properties": {
+                "VpcId": {"Ref": "SpaceVPC"}
+            }
+        },
+        "WebServerSubnetRoute": {
+            "Type": "AWS::EC2::Route",
+            "Properties": {
+                "RouteTableId": {"Ref": "WebServerSubnetRouteTable"},
+                "DestinationCidrBlock": "0.0.0.0/0",
+                "GatewayId": {"Ref": "SpaceIGW"}
+            },
+            "DependsOn": ["SpaceIGWAttachment"]
+        },
+        "WebServerSubnetRouteTableAssociation": {
+            "Type": "AWS::EC2::SubnetRouteTableAssociation",
+            "Properties": {
+                "RouteTableId": {"Ref": "WebServerSubnetRouteTable"},
+                "SubnetId": {"Ref": "WebServerSubnet"}
+            }
+        },
+        "SpaceBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                }
+            }
+        },
+        "PackagesBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                },
+                "OwnershipControls": {
+                    "Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]
+                },
+                "CorsConfiguration": {
+                    "CorsRules": [{
+                        "AllowedMethods": ["GET"],
+                        "AllowedOrigins": ["*"],
+                        "AllowedHeaders": ["*"],
+                        "MaxAge": 0
+                    }]
+                }
+            }
+        },
+        "VcsBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                }
+            }
+        },
+        "AutomationDslBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                }
+            }
+        },
+        "AutomationFileshareBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                }
+            }
+        },
+        "AutomationLogsBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                }
+            }
+        },
+        "SpaceARecord": {
+            "Type": "AWS::Route53::RecordSet",
+            "Condition": "OwnDomain",
+            "Properties": {
+                "HostedZoneName": {"Fn::Sub": "${HostedZoneName}."},
+                "Name": {"Fn::Sub": "${HostedZoneName}."},
+                "Type": "A",
+                "TTL": "600",
+                "ResourceRecords": [{"Ref": "ElasticIP"}]
+            }
+        },
+        "PackagesARecord": {
+            "Type": "AWS::Route53::RecordSet",
+            "Condition": "OwnDomain",
+            "Properties": {
+                "HostedZoneName": {"Fn::Sub": "${HostedZoneName}."},
+                "Name": {"Fn::Sub": "pkg.${HostedZoneName}."},
+                "Type": "A",
+                "TTL": "600",
+                "ResourceRecords": [{"Ref": "ElasticIP"}]
+            }
+        },
+        "VcsARecord": {
+            "Type": "AWS::Route53::RecordSet",
+            "Condition": "OwnDomain",
+            "Properties": {
+                "HostedZoneName": {"Fn::Sub": "${HostedZoneName}."},
+                "Name": {"Fn::Sub": "git.${HostedZoneName}."},
+                "Type": "A",
+                "TTL": "600",
+                "ResourceRecords": [{"Ref": "ElasticIP"}]
+            }
+        }
+    },
+    "Outputs": {
+        "SpaceURL": {
+            "Description": "Space URL",
+            "Value": {
+                "Fn::If": [
+                    "OwnDomain",
+                    {"Fn::Sub": "https://${HostedZoneName}"},
+                    {"Fn::Join": ["", ["http://space-", {"Fn::Join": ["-", {"Fn::Split": [".", {"Ref": "ElasticIP"}]}]}, ".nip.io"]]}
+                ]
+            }
+        },
+        "SSHPrivateKey": {
+            "Description": "Private key to access the Space EC2 machine via SSH (port 9222)",
+            "Value": {"Fn::Sub": "https://${AWS::Region}.console.aws.amazon.com/systems-manager/parameters/ec2/keypair/${WebServerKeyPair.KeyPairId}"}
+        }
+    }
+}
